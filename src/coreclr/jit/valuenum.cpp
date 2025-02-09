@@ -6245,7 +6245,19 @@ void Compiler::fgValueNumberArrayElemLoad(GenTree* loadTree, VNFuncApp* addrFunc
     ValueNum  loadValueVN = vnStore->VNForLoad(VNK_Liberal, wholeElem, elemSize, loadType, offset, loadSize);
 
     loadTree->gtVNPair.SetLiberal(loadValueVN);
-    loadTree->gtVNPair.SetConservative(vnStore->VNForExpr(compCurBB, loadType));
+
+    // If this is a local array, there are no asyncronous modifications, so we can set the
+    // conservative VN to the liberal VN.
+    //
+    VNFuncApp arrFn;
+    if (vnStore->IsVNNewLocalArr(arrVN, &arrFn))
+    {
+        loadTree->gtVNPair.SetConservative(loadValueVN);
+    }
+    else
+    {
+        loadTree->gtVNPair.SetConservative(vnStore->VNForExpr(compCurBB, loadType));
+    }
 }
 
 //------------------------------------------------------------------------
@@ -6553,6 +6565,16 @@ bool ValueNumStore::IsVNInt32Constant(ValueNum vn)
     return TypeOfVN(vn) == TYP_INT;
 }
 
+//------------------------------------------------------------------------
+// IsVNNeverNegative: Determines if the given value number can never take on a negative value
+// in a signed context (i.e. when the most-significant bit represents signedness).
+//
+// Parameters:
+//    vn - Value number to query
+//
+// Returns:
+//    True if the most-significant bit is never set, false otherwise.
+//
 bool ValueNumStore::IsVNNeverNegative(ValueNum vn)
 {
     auto vnVisitor = [this](ValueNum vn) -> VNVisit {
@@ -6595,15 +6617,10 @@ bool ValueNumStore::IsVNNeverNegative(ValueNum vn)
                 case VNF_LE:
                 case VNF_EQ:
                 case VNF_NE:
-                case VNF_UMOD:
-                case VNF_UDIV:
                 case VNF_GE_UN:
                 case VNF_GT_UN:
                 case VNF_LE_UN:
                 case VNF_LT_UN:
-                case VNF_ADD_UN_OVF:
-                case VNF_SUB_UN_OVF:
-                case VNF_MUL_UN_OVF:
                 case VNF_MDArrLowerBound:
 #ifdef FEATURE_HW_INTRINSICS
 #ifdef TARGET_XARCH
@@ -7354,7 +7371,22 @@ bool ValueNumStore::IsVNNewArr(ValueNum vn, VNFuncApp* funcApp)
     bool result = false;
     if (GetVNFunc(vn, funcApp))
     {
-        result = (funcApp->m_func == VNF_JitNewArr) || (funcApp->m_func == VNF_JitReadyToRunNewArr);
+        result = (funcApp->m_func == VNF_JitNewArr) || (funcApp->m_func == VNF_JitNewLclArr) ||
+                 (funcApp->m_func == VNF_JitReadyToRunNewArr) || (funcApp->m_func == VNF_JitReadyToRunNewLclArr);
+    }
+    return result;
+}
+
+bool ValueNumStore::IsVNNewLocalArr(ValueNum vn, VNFuncApp* funcApp)
+{
+    if (vn == NoVN)
+    {
+        return false;
+    }
+    bool result = false;
+    if (GetVNFunc(vn, funcApp))
+    {
+        result = (funcApp->m_func == VNF_JitNewLclArr) || (funcApp->m_func == VNF_JitReadyToRunNewLclArr);
     }
     return result;
 }
@@ -8239,8 +8271,8 @@ ValueNum ValueNumStore::EvalHWIntrinsicFunBinary(
 
         if (oper != GT_NONE)
         {
-            // We shouldn't find AND_NOT nodes since it should only be produced in lowering
-            assert(oper != GT_AND_NOT);
+            // We shouldn't find AND_NOT, OR_NOT or XOR_NOT nodes since it should only be produced in lowering
+            assert((oper != GT_AND_NOT) && (oper != GT_OR_NOT) && (oper != GT_XOR_NOT));
 
             if (varTypeIsMask(type))
             {
@@ -8383,7 +8415,7 @@ ValueNum ValueNumStore::EvalHWIntrinsicFunBinary(
         genTreeOps oper     = tree->GetOperForHWIntrinsicId(&isScalar);
 
         // We shouldn't find AND_NOT nodes since it should only be produced in lowering
-        assert(oper != GT_AND_NOT);
+        assert((oper != GT_AND_NOT) && (oper != GT_OR_NOT) && (oper != GT_XOR_NOT));
 
         if (isScalar)
         {
@@ -8871,7 +8903,7 @@ ValueNum ValueNumStore::EvalHWIntrinsicFunBinary(
         genTreeOps oper     = tree->GetOperForHWIntrinsicId(&isScalar);
 
         // We shouldn't find AND_NOT nodes since it should only be produced in lowering
-        assert(oper != GT_AND_NOT);
+        assert((oper != GT_AND_NOT) && (oper != GT_OR_NOT) && (oper != GT_XOR_NOT));
 
         if (isScalar)
         {
@@ -10801,6 +10833,13 @@ PhaseStatus Compiler::fgValueNumber()
         }
     }
 
+    assert(m_dfsTree != nullptr);
+
+    if (m_loops == nullptr)
+    {
+        m_loops = FlowGraphNaturalLoops::Find(m_dfsTree);
+    }
+
     m_blockToLoop = BlockToNaturalLoopMap::Build(m_loops);
     // Compute the side effects of loops.
     optComputeLoopSideEffects();
@@ -10904,6 +10943,7 @@ PhaseStatus Compiler::fgValueNumber()
 #endif // DEBUG
 
     fgVNPassesCompleted++;
+    vnState = nullptr;
 
     return PhaseStatus::MODIFIED_EVERYTHING;
 }
@@ -11191,7 +11231,7 @@ void Compiler::fgValueNumberPhiDef(GenTreeLclVar* newSsaDef, BasicBlock* blk, bo
     for (GenTreePhi::Use& use : phiNode->Uses())
     {
         GenTreePhiArg* phiArg = use.GetNode()->AsPhiArg();
-        if (!vnState->IsReachableThroughPred(blk, phiArg->gtPredBB))
+        if ((vnState != nullptr) && !vnState->IsReachableThroughPred(blk, phiArg->gtPredBB))
         {
             JITDUMP("  Phi arg [%06u] is unnecessary; path through pred " FMT_BB " cannot be taken\n",
                     dspTreeID(phiArg), phiArg->gtPredBB->bbNum);
@@ -12713,7 +12753,8 @@ void Compiler::fgValueNumberTree(GenTree* tree)
 
                         // Record non-constant value numbers that are used as the length argument to bounds checks, so
                         // that assertion prop will know that comparisons against them are worth analyzing.
-                        ValueNum lengthVN = tree->AsBoundsChk()->GetArrayLength()->gtVNPair.GetConservative();
+                        ValueNum lengthVN =
+                            vnStore->VNNormalValue(tree->AsBoundsChk()->GetArrayLength()->gtVNPair.GetConservative());
                         if ((lengthVN != ValueNumStore::NoVN) && !vnStore->IsVNConstant(lengthVN))
                         {
                             vnStore->SetVNIsCheckedBound(lengthVN);
@@ -13475,6 +13516,7 @@ void Compiler::fgValueNumberHelperCallFunc(GenTreeCall* call, VNFunc vnf, ValueN
         break;
 
         case VNF_JitNewArr:
+        case VNF_JitNewLclArr:
         {
             generateUniqueVN  = true;
             ValueNumPair vnp1 = vnStore->VNPNormalPair(args->GetArgByIndex(1)->GetNode()->gtVNPair);
@@ -13513,6 +13555,7 @@ void Compiler::fgValueNumberHelperCallFunc(GenTreeCall* call, VNFunc vnf, ValueN
         break;
 
         case VNF_JitReadyToRunNewArr:
+        case VNF_JitReadyToRunNewLclArr:
         {
             generateUniqueVN  = true;
             ValueNumPair vnp1 = vnStore->VNPNormalPair(args->GetArgByIndex(0)->GetNode()->gtVNPair);
@@ -14324,7 +14367,22 @@ bool Compiler::fgValueNumberHelperCall(GenTreeCall* call)
                 }
             }
 
+            if (isAlloc && ((call->gtCallMoreFlags & GTF_CALL_M_STACK_ARRAY) != 0))
+            {
+                if (vnf == VNF_JitNewArr)
+                {
+                    vnf = VNF_JitNewLclArr;
+                    // modHeap = false;
+                }
+                else if (vnf == VNF_JitReadyToRunNewArr)
+                {
+                    vnf = VNF_JitReadyToRunNewLclArr;
+                    // modHeap = false;
+                }
+            }
+
             fgValueNumberHelperCallFunc(call, vnf, vnpExc);
+
             return modHeap;
         }
         else

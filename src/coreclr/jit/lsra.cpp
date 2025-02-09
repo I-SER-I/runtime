@@ -535,6 +535,8 @@ static const regMaskTP LsraLimitSmallFPSet = (RBM_XMM0 | RBM_XMM1 | RBM_XMM2 | R
 static const regMaskTP LsraLimitUpperSimdSet =
     (RBM_XMM16 | RBM_XMM17 | RBM_XMM18 | RBM_XMM19 | RBM_XMM20 | RBM_XMM21 | RBM_XMM22 | RBM_XMM23 | RBM_XMM24 |
      RBM_XMM25 | RBM_XMM26 | RBM_XMM27 | RBM_XMM28 | RBM_XMM29 | RBM_XMM30 | RBM_XMM31);
+static const regMaskTP LsraLimitExtGprSet =
+    (RBM_R16 | RBM_R17 | RBM_R18 | RBM_R19 | RBM_R20 | RBM_R21 | RBM_R22 | RBM_R23 | RBM_ETW_FRAMED_EBP);
 #elif defined(TARGET_ARM)
 // On ARM, we may need two registers to set up the target register for a virtual call, so we need
 // to have at least the maximum number of arg registers, plus 2.
@@ -551,7 +553,7 @@ static const regMaskTP LsraLimitSmallIntSet = (RBM_T1 | RBM_T3 | RBM_A0 | RBM_A1
 static const regMaskTP LsraLimitSmallFPSet  = (RBM_F0 | RBM_F1 | RBM_F2 | RBM_F8 | RBM_F9);
 #elif defined(TARGET_RISCV64)
 static const regMaskTP LsraLimitSmallIntSet = (RBM_T1 | RBM_T3 | RBM_A0 | RBM_A1 | RBM_T0);
-static const regMaskTP LsraLimitSmallFPSet  = (RBM_F0 | RBM_F1 | RBM_F2 | RBM_F8 | RBM_F9);
+static const regMaskTP LsraLimitSmallFPSet  = (RBM_FT0 | RBM_FT1 | RBM_FT2 | RBM_FS0 | RBM_FS1);
 #else
 #error Unsupported or unset target architecture
 #endif // target
@@ -625,6 +627,13 @@ SingleTypeRegSet LinearScan::stressLimitRegs(RefPosition* refPosition, RegisterT
                 {
                     mask = getConstrainedRegMask(refPosition, regType, mask,
                                                  LsraLimitUpperSimdSet.GetRegSetForType(regType), minRegCount);
+                }
+                break;
+            case LSRA_LIMIT_EXT_GPR_SET:
+                if ((mask & LsraLimitExtGprSet) != RBM_NONE)
+                {
+                    mask = getConstrainedRegMask(refPosition, regType, mask,
+                                                 LsraLimitExtGprSet.GetRegSetForType(regType), minRegCount);
                 }
                 break;
 #endif
@@ -787,6 +796,10 @@ LinearScan::LinearScan(Compiler* theCompiler)
 #if defined(TARGET_AMD64)
     rbmAllFloat       = compiler->rbmAllFloat;
     rbmFltCalleeTrash = compiler->rbmFltCalleeTrash;
+    rbmAllInt         = compiler->rbmAllInt;
+    rbmIntCalleeTrash = compiler->rbmIntCalleeTrash;
+    regIntLast        = compiler->regIntLast;
+    isApxSupported    = compiler->canUseApxEncoding();
 #endif // TARGET_AMD64
 
 #if defined(TARGET_XARCH)
@@ -902,7 +915,14 @@ LinearScan::LinearScan(Compiler* theCompiler)
     availableRegs[static_cast<int>(TYP_##tn)] = &regFld;
 #include "typelist.h"
 #undef DEF_TP
-
+    // Updating lowGprRegs with final value
+#if defined(TARGET_XARCH)
+#if defined(TARGET_AMD64)
+    lowGprRegs = (availableIntRegs & RBM_LOWINT.GetIntRegSet());
+#else
+    lowGprRegs = availableIntRegs;
+#endif // TARGET_AMD64
+#endif // TARGET_XARCH
     compiler->rpFrameType           = FT_NOT_SET;
     compiler->rpMustCreateEBPCalled = false;
 
@@ -947,13 +967,16 @@ void LinearScan::setBlockSequence()
     bbVisitedSet = BitVecOps::MakeEmpty(traits);
 
     assert((blockSequence == nullptr) && (bbSeqCount == 0));
-    FlowGraphDfsTree* const dfsTree = compiler->fgComputeDfs</* useProfile */ true>();
+
+    compiler->m_dfsTree             = compiler->fgComputeDfs</* useProfile */ true>();
+    FlowGraphDfsTree* const dfsTree = compiler->m_dfsTree;
     blockSequence                   = new (compiler, CMK_LSRA) BasicBlock*[compiler->fgBBcount];
 
     if (compiler->opts.OptimizationEnabled() && dfsTree->HasCycle())
     {
-        // Ensure loop bodies are compact in the visitation order
-        FlowGraphNaturalLoops* const loops = FlowGraphNaturalLoops::Find(dfsTree);
+        // Ensure loop bodies are compact in the visitation order.
+        compiler->m_loops                  = FlowGraphNaturalLoops::Find(dfsTree);
+        FlowGraphNaturalLoops* const loops = compiler->m_loops;
         unsigned                     index = 0;
 
         auto addToSequence = [this, &index](BasicBlock* block) {
@@ -1308,6 +1331,19 @@ PhaseStatus LinearScan::doLinearScan()
 #endif
 
     compiler->compLSRADone = true;
+
+    // If edge resolution didn't create new blocks,
+    // cache the block sequence so it can be used as an initial layout during block reordering.
+    if (compiler->fgBBcount == bbSeqCount)
+    {
+        compiler->fgBBs = blockSequence;
+    }
+    else
+    {
+        assert(compiler->fgBBcount > bbSeqCount);
+        compiler->fgBBs = nullptr;
+        compiler->fgInvalidateDfsTree();
+    }
 
     return PhaseStatus::MODIFIED_EVERYTHING;
 }
@@ -2759,6 +2795,7 @@ bool LinearScan::isMatchingConstant(RegRecord* physRegRecord, RefPosition* refPo
             break;
         }
 
+#if defined(FEATURE_SIMD)
         case GT_CNS_VEC:
         {
             return
@@ -2767,11 +2804,14 @@ bool LinearScan::isMatchingConstant(RegRecord* physRegRecord, RefPosition* refPo
 #endif
                 GenTreeVecCon::Equals(refPosition->treeNode->AsVecCon(), otherTreeNode->AsVecCon());
         }
+#endif // FEATURE_SIMD
 
+#if defined(FEATURE_MASKED_HW_INTRINSICS)
         case GT_CNS_MSK:
         {
             return GenTreeMskCon::Equals(refPosition->treeNode->AsMskCon(), otherTreeNode->AsMskCon());
         }
+#endif // FEATURE_MASKED_HW_INTRINSICS)
 
         default:
             break;
@@ -9984,10 +10024,8 @@ void LinearScan::dumpLsraStats(FILE* file)
 
     fprintf(file, "----------\n");
 #ifdef DEBUG
-    LPCWSTR lsraOrder = JitConfig.JitLsraOrdering() == nullptr ? W("ABCDEFGHIJKLMNOPQ") : JitConfig.JitLsraOrdering();
-    char    lsraOrderUtf8[(REGSELECT_HEURISTIC_COUNT * 3) + 1] = {};
-    WideCharToMultiByte(CP_UTF8, 0, lsraOrder, -1, lsraOrderUtf8, ARRAY_SIZE(lsraOrderUtf8), nullptr, nullptr);
-    fprintf(file, "Register selection order: %s\n", lsraOrderUtf8);
+    const char* lsraOrder = JitConfig.JitLsraOrdering() == nullptr ? "ABCDEFGHIJKLMNOPQ" : JitConfig.JitLsraOrdering();
+    fprintf(file, "Register selection order: %s\n", lsraOrder);
 #endif
     fprintf(file, "Total Tracked Vars:  %d\n", compiler->lvaTrackedCount);
     fprintf(file, "Total Reg Cand Vars: %d\n", regCandidateVarCount);
@@ -12391,10 +12429,10 @@ LinearScan::RegisterSelection::RegisterSelection(LinearScan* linearScan)
 #define BUSY_REG_SEL_DEF(stat, value, shortname, orderSeqId) REG_SEL_DEF(stat, value, shortname, orderSeqId)
 #include "lsra_score.h"
 
-    LPCWSTR ordering = JitConfig.JitLsraOrdering();
+    const char* ordering = JitConfig.JitLsraOrdering();
     if (ordering == nullptr)
     {
-        ordering = W("ABCDEFGHIJKLMNOPQ");
+        ordering = "ABCDEFGHIJKLMNOPQ";
 
         if (!linearScan->enregisterLocalVars && linearScan->compiler->opts.OptimizationDisabled()
 #ifdef TARGET_ARM64
@@ -12402,7 +12440,7 @@ LinearScan::RegisterSelection::RegisterSelection(LinearScan* linearScan)
 #endif
         )
         {
-            ordering = W("MQQQQQQQQQQQQQQQQ");
+            ordering = "MQQQQQQQQQQQQQQQQ";
         }
     }
 
